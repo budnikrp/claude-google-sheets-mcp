@@ -305,7 +305,7 @@ class GetSpreadsheetInfoHandler(SheetsToolHandler):
                 drive_service.files()
                 .get(
                     fileId=spreadsheet_id,
-                    fields="id, name, createdTime, modifiedTime, owners, shared, webViewLink, size, parents",
+                    fields="id,name,createdTime,modifiedTime,owners,shared,webViewLink,size,parents",
                 )
                 .execute()
             )
@@ -315,7 +315,7 @@ class GetSpreadsheetInfoHandler(SheetsToolHandler):
             sheets_info = (
                 sheets_service.spreadsheets()
                 .get(
-                    spreadsheetId=spreadsheet_id, fields="properties, sheets.properties"
+                    spreadsheetId=spreadsheet_id, fields="properties,sheets.properties"
                 )
                 .execute()
             )
