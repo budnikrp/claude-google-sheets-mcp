@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from googleapiclient.errors import HttpError
@@ -370,10 +371,212 @@ class ClearRangeHandler(SheetsToolHandler):
             return self.format_error_response(e)
 
 
+def _column_letters_to_index(letters: str) -> int:
+    """Convert spreadsheet column letters (A, B, ..., AA) to a 0-based index."""
+    index = 0
+    for char in letters.upper():
+        if not char.isalpha():
+            raise InvalidRangeError(f"Invalid column reference: {letters}")
+        index = index * 26 + (ord(char) - ord("A") + 1)
+    return index - 1
+
+
+def _parse_a1_range(a1_range: str) -> Dict[str, Any]:
+    """Parse an A1 notation range into a sheet title and grid boundaries.
+
+    Row and column bounds are omitted when the range leaves them open, which
+    is what makes a filter cover every current and future row (e.g. 'A:C').
+    """
+    sheet_title: Optional[str] = None
+    cell_part = a1_range.strip()
+
+    if "!" in cell_part:
+        sheet_title, cell_part = cell_part.rsplit("!", 1)
+        sheet_title = sheet_title.strip().strip("'").replace("''", "'")
+
+    grid: Dict[str, Any] = {}
+
+    if not cell_part:
+        return {"sheet_title": sheet_title, "grid": grid}
+
+    endpoints = cell_part.split(":")
+    if len(endpoints) > 2:
+        raise InvalidRangeError(f"Invalid range: {a1_range}")
+
+    parsed = []
+    for endpoint in endpoints:
+        match = re.fullmatch(r"([A-Za-z]*)(\d*)", endpoint.strip())
+        if not match or endpoint.strip() == "":
+            raise InvalidRangeError(f"Invalid range: {a1_range}")
+        column, row = match.groups()
+        parsed.append(
+            (
+                _column_letters_to_index(column) if column else None,
+                int(row) - 1 if row else None,
+            )
+        )
+
+    start_column, start_row = parsed[0]
+    end_column, end_row = parsed[1] if len(parsed) == 2 else parsed[0]
+
+    if start_column is not None:
+        grid["startColumnIndex"] = start_column
+    if start_row is not None:
+        grid["startRowIndex"] = start_row
+    if end_column is not None:
+        grid["endColumnIndex"] = end_column + 1
+    if end_row is not None:
+        grid["endRowIndex"] = end_row + 1
+
+    return {"sheet_title": sheet_title, "grid": grid}
+
+
+class SetFilterRangeHandler(SheetsToolHandler):
+    """Handler for setting the basic filter range on a sheet."""
+
+    def __init__(self, auth: GoogleSheetsAuth) -> None:
+        super().__init__(
+            name="set_filter_range",
+            description=(
+                "Set the basic filter range on a sheet so newly added rows are "
+                "included. Use an open-ended range such as 'Sheet1!A:C' to cover "
+                "every future row."
+            ),
+        )
+        self.auth = auth
+
+    def get_tool_definition(self) -> Tool:
+        return Tool(
+            name=self.name,
+            description=self.description,
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "spreadsheet_id": {
+                        "type": "string",
+                        "description": "The ID of the spreadsheet",
+                    },
+                    "range": {
+                        "type": "string",
+                        "description": (
+                            "The A1 notation range the filter should cover (e.g., "
+                            "'Sheet1!A:C'). Omit the row numbers so the filter "
+                            "keeps covering rows added later. Defaults to all "
+                            "columns of the first sheet."
+                        ),
+                    },
+                    "preserve_criteria": {
+                        "type": "boolean",
+                        "description": (
+                            "Carry the existing filter's criteria and sort order "
+                            "over to the new range (default: true)"
+                        ),
+                        "default": True,
+                    },
+                },
+                "required": ["spreadsheet_id"],
+            },
+        )
+
+    async def execute(self, arguments: Dict[str, Any]) -> List[TextContent]:
+        """Execute the set filter range operation."""
+        range_name = arguments.get("range", "")
+        try:
+            self.validate_arguments(arguments, ["spreadsheet_id"])
+
+            spreadsheet_id = arguments["spreadsheet_id"]
+            preserve_criteria = arguments.get("preserve_criteria", True)
+
+            parsed = _parse_a1_range(range_name) if range_name else {
+                "sheet_title": None,
+                "grid": {},
+            }
+
+            sheets_service = self.auth.get_sheets_service()
+            metadata = (
+                sheets_service.spreadsheets()
+                .get(
+                    spreadsheetId=spreadsheet_id,
+                    fields="sheets(properties(sheetId,title),basicFilter)",
+                )
+                .execute()
+            )
+
+            sheets = metadata.get("sheets", [])
+            if not sheets:
+                raise SheetsAPIError("Spreadsheet contains no sheets", 404)
+
+            target_title = parsed["sheet_title"]
+            if target_title:
+                target = next(
+                    (
+                        sheet
+                        for sheet in sheets
+                        if sheet["properties"]["title"] == target_title
+                    ),
+                    None,
+                )
+                if target is None:
+                    raise SheetsAPIError(f"Sheet not found: {target_title}", 404)
+            else:
+                target = sheets[0]
+
+            grid_range = dict(parsed["grid"])
+            grid_range["sheetId"] = target["properties"]["sheetId"]
+            grid_range.setdefault("startRowIndex", 0)
+            grid_range.setdefault("startColumnIndex", 0)
+
+            filter_spec: Dict[str, Any] = {"range": grid_range}
+
+            existing_filter = target.get("basicFilter") or {}
+            carried_over = False
+            if preserve_criteria and existing_filter:
+                existing_range = existing_filter.get("range", {})
+                same_start_column = existing_range.get(
+                    "startColumnIndex", 0
+                ) == grid_range.get("startColumnIndex", 0)
+                # Criteria are keyed by column offset from the filter's first
+                # column, so they only transfer when that column is unchanged.
+                if same_start_column:
+                    for key in ("criteria", "filterSpecs", "sortSpecs"):
+                        if existing_filter.get(key):
+                            filter_spec[key] = existing_filter[key]
+                            carried_over = True
+
+            sheets_service.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"requests": [{"setBasicFilter": {"filter": filter_spec}}]},
+            ).execute()
+
+            response_data = {
+                "spreadsheet_id": spreadsheet_id,
+                "sheet": target["properties"]["title"],
+                "filter_range": grid_range,
+                "criteria_preserved": carried_over,
+                "covers_new_rows": "endRowIndex" not in grid_range,
+            }
+
+            return self.format_success_response(
+                json.dumps(response_data, indent=2),
+                f"Filter set on {target['properties']['title']}"
+                f"{' (existing criteria kept)' if carried_over else ''}",
+            )
+
+        except HttpError as e:
+            if e.resp.status == 400:
+                raise InvalidRangeError(f"Invalid range: {range_name}")
+            elif e.resp.status == 404:
+                raise SheetsAPIError("Spreadsheet not found", 404)
+            else:
+                raise SheetsAPIError(f"Sheets API error: {e.reason}", e.resp.status)
+        except Exception as e:
+            return self.format_error_response(e)
+
 # Registry of all sheets tool handlers
 SHEETS_HANDLERS = [
     ReadRangeHandler,
     WriteRangeHandler,
     AppendDataHandler,
     ClearRangeHandler,
+    SetFilterRangeHandler,
 ]
